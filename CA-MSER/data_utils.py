@@ -604,6 +604,84 @@ class SERDataset:
     def get_test_dataset(self):
         return TestDataset(
             self.test_data, num_classes=self.num_classes)
+    
+class SERInput:
+    """
+    适配单说话者实时数据版本的SER数据集类
+    - 处理无标签数据
+    - 禁用过采样
+    - 简化数据加载逻辑
+    """
+    def __init__(self, features_data):
+        # 直接从features_data['audio']获取数据
+        audio_features = features_data['audio']
+        
+        # 初始化训练数据 (全部数据视为训练数据)
+        self.spec_data = audio_features['seg_spec'].astype(np.float32)
+        self.mfcc_data = audio_features['seg_mfcc'].astype(np.float32)
+        self.audio_data = audio_features['seg_audio'].astype(np.float32)
+        self.seg_num = audio_features['seg_num']
+
+        # 禁用标签相关属性
+        self.train_seg_labels = None
+        self.train_labels = None
+        self.num_classes = 7  # 无类别
+
+        # 验证/测试数据置空
+        # self.val_spec_data = np.array([])
+        # self.val_mfcc_data = np.array([])
+        # self.val_audio_data = np.array([])
+        # self.test_spec_data = np.array([])
+        # self.test_mfcc_data = np.array([])
+        # self.test_audio_data = np.array([])
+
+        # 数据归一化
+        self._normalize('minmax')
+
+        # 转换为灰度图像格式
+        self.spec_data = self._spec_to_gray(self.spec_data)
+        self.num_in_ch = 1
+
+        # 构建数据字典
+        self.data = {
+            "seg_spec": self.spec_data,
+            "seg_mfcc": self.mfcc_data,
+            "seg_audio": self.audio_data,
+            "seg_num": self.seg_num
+        }
+
+        # 移除原代码中的断言和验证逻辑
+        print('\n<< 实时数据处理配置 >>')
+        print(f'有效数据段数: {self.spec_data.shape[0]}')
+        print(f'频谱图维度: {self.spec_data.shape}')
+        print(f'MFCC特征维度: {self.mfcc_data.shape}')
+        print(f'音频波形维度: {self.audio_data.shape}\n')
+
+    def _normalize(self, scaling):
+        """归一化处理"""
+        # 计算原始数据范围
+        input_min = np.min(self.spec_data)
+        input_max = np.max(self.spec_data)
+        
+        # 执行最小-最大归一化
+        self.spec_data = (self.spec_data - input_min) / (input_max - input_min + 1e-8)
+        
+        print(f'\n数据归一化完成')
+        print(f'\t原始范围: [{input_min:.2f}, {input_max:.2f}]')
+        print(f'\t归一化后范围: [{np.min(self.spec_data):.2f}, {np.max(self.spec_data):.2f}]')
+
+    def _spec_to_gray(self, data):
+        """适配实时数据的灰度转换"""
+        # 移除AlexNet预处理
+        data = np.clip(data, 0.0, 1.0)
+        data = (data * 255.0).astype(np.uint8)
+        data = np.flip(data, axis=2)  # 频率轴翻转
+        return data
+
+    def get_data(self):
+        """返回统一数据接口"""
+        return self.data
+
                        
 
 def random_oversample(data, labels):
