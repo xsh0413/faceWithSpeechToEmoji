@@ -1,0 +1,843 @@
+import pickle
+import numpy as np
+import torch
+from torchvision import transforms
+from sklearn.metrics import confusion_matrix
+import pandas as pd
+from imblearn.over_sampling import RandomOverSampler
+from collections import Counter
+from sklearn import preprocessing
+import random
+from PIL import Image, ImageOps
+import matplotlib.pyplot as plt
+from collections import defaultdict
+
+SCALER_TYPE = {'standard':'preprocessing.StandardScaler()',
+               'minmax'  :'preprocessing.MinMaxScaler(feature_range=(0,1))'
+              }
+
+
+class TrainDataset(torch.utils.data.Dataset):
+    """
+    data : ndarray
+        Input data of shape `N x C x H x W`, where `N` is the number of examples
+        (segments), C is number of input channels (3 in the case of image), `H` is image height,
+        `W` is image width
+    target : ndarray
+        Labels for segments (note that one utterance might contain more than
+        one segments) of shape `(N,)`.
+    num_classes :
+        Number of classes.    
+    """
+    def __init__(self, data, num_classes=4):
+        super(TrainDataset).__init__()
+        self.data_spec = data['seg_spec']
+        self.data_mfcc = data['seg_mfcc']
+        self.data_audio = data['seg_audio']
+        self.seg_label = data['seg_label']
+        # self.target = target
+        self.n_samples = len(self.seg_label)
+        self.num_classes = num_classes
+
+    def __len__(self):
+        return self.n_samples
+
+    def __getitem__(self, index):
+        sample = {
+            'seg_spec': self.data_spec[index], 
+            'seg_mfcc': self.data_mfcc[index],
+            'seg_audio': self.data_audio[index],
+            'seg_label': self.seg_label[index]
+            } 
+        return sample
+        
+    def get_preds(self, preds):
+        """
+        Get predictions for all utterances from their segments' prediction.
+        This function will accumulate the predictions for each utterance by
+        taking the maximum probability along the dimension 0 of all segments
+        belonging to that particular utterance.
+        """     
+        preds = np.argmax(preds, axis=1)
+        return preds
+
+        
+    def weighted_accuracy(self, predictions):
+        """
+        Calculate accuracy score given the predictions.
+
+        Parameters
+        ----------
+        predictions : ndarray
+            Model's predictions.
+
+        Returns
+        -------
+        float
+            Accuracy score.
+
+        """
+        acc = (self.seg_label == predictions).sum() / self.n_samples
+        return acc
+
+
+    def unweighted_accuracy(self, predictions):
+        """
+        Calculate unweighted accuracy score given the predictions.
+
+        Parameters
+        ----------
+        utt_preds : ndarray
+            Processed predictions.
+
+        Returns
+        -------
+        float
+            Unweighted Accuracy (UA) score.
+
+        """
+
+
+        class_acc = 0
+        n_classes = 0
+        for c in range(self.num_classes):
+            class_pred = np.multiply(( self.seg_label == predictions),
+                                     ( self.seg_label == c)).sum()
+            
+            if (self.seg_label == c).sum() > 0:
+                 class_pred /= ( self.seg_label == c).sum()
+                 n_classes += 1
+
+                 class_acc += class_pred
+            
+        return class_acc / n_classes
+
+
+
+class TestDataset(torch.utils.data.Dataset):
+    """
+    Holds data for a validation/test set.
+
+    Parameters
+    ----------
+    data : ndarray
+        Input data of shape `N x C x H x W`, where `N` is the number of examples
+        (segments), C is number of input channels (3 in the case of image), `H` is image height, 
+        `W` is image width
+    actual_target : ndarray
+        Actual target labels (labels for utterances) of shape `(U,)`, where
+        `U` is the number of utterances.
+    seg_target : ndarray
+        Labels for segments (note that one utterance might contain more than
+        one segments) of shape `(N,)`.
+    num_segs : ndarray
+        Array of shape `(U,)` indicating how many segments each utterance
+        contains.
+    num_classes :
+        Number of classes.
+    """
+        
+    def __init__(self, data, num_classes=4):
+        super(TestDataset).__init__()
+        # self.data = data
+        self.data_spec = data['seg_spec']
+        self.data_mfcc = data['seg_mfcc']
+        self.data_audio = data['seg_audio']
+        # self.utter_label = data['utter_label']
+        # self.seg_label = data['seg_label']
+        # self.seg_num = data['seg_num']
+        
+        self.target = data['seg_label']
+        self.n_samples = len(self.target)
+        self.actual_target = data['utter_label']
+        self.n_actual_samples = len(self.actual_target)
+        self.num_segs = data['seg_num']
+        self.num_classes = num_classes
+
+
+    def __len__(self):
+        return self.n_samples
+
+    def __getitem__(self, index):
+        sample = {
+            'seg_spec': self.data_spec[index], 
+            'seg_mfcc': self.data_mfcc[index],
+            'seg_audio': self.data_audio[index],
+            'seg_label': self.target[index]#,
+            #'utter_label': self.actual_target[index],
+            #'seg_num': self.num_segs[index]
+            } 
+        return sample
+        # return self.data[index], self.target[index]
+
+    def get_preds(self, seg_preds):
+        """
+        Get predictions for all utterances from their segments' prediction.
+        This function will accumulate the predictions for each utterance by
+        taking the maximum probability along the dimension 0 of all segments
+        belonging to that particular utterance.
+        """
+        preds = np.empty(
+            shape=(self.n_actual_samples, self.num_classes), dtype="float")
+
+        end = 0
+        
+        for v in range(self.n_actual_samples):
+            start = end
+            end = start + self.num_segs[v]
+            
+            '''
+            # remove the last one for long utterances
+            if self.num_segs[v] > 1:
+                end = end - 1
+                
+            preds[v] = np.average(seg_preds[start:end], axis=0)
+            
+            if self.num_segs[v] > 1:
+                end = end + 1
+            
+            
+            # choose the most certain one
+            tmp_seg = -1
+            for seg in range(self.num_segs[v]):
+                end_seg = start + seg
+                if np.max(seg_preds[end_seg]) - np.min(seg_preds[end_seg]) > tmp_seg:
+                    tmp_seg = np.max(seg_preds[end_seg]) - np.min(seg_preds[end_seg])
+                    preds[v] = seg_preds[end_seg]
+            '''  
+            preds[v] = np.average(seg_preds[start:end], axis=0)
+                                 
+        preds = np.argmax(preds, axis=1)
+        return preds
+
+
+    def weighted_accuracy(self, utt_preds):
+        """
+        Calculate accuracy score given the predictions.
+
+        Parameters
+        ----------
+        utt_preds : ndarray
+            Processed predictions.
+
+        Returns
+        -------
+        float
+            Accuracy score.
+
+        """
+
+        acc = (self.actual_target == utt_preds).sum() / self.n_actual_samples
+        return acc
+
+
+    def unweighted_accuracy(self, utt_preds):
+        """
+        Calculate unweighted accuracy score given the predictions.
+
+        Parameters
+        ----------
+        utt_preds : ndarray
+            Processed predictions.
+
+        Returns
+        -------
+        float
+            Unweighted Accuracy (UA) score.
+
+        """
+        class_acc = 0
+        n_classes = 0
+        
+        for c in range(self.num_classes):
+            class_pred = np.multiply((self.actual_target == utt_preds),
+                                     (self.actual_target == c)).sum()
+
+        
+            if (self.actual_target == c).sum() > 0:    
+                class_pred /= (self.actual_target == c).sum()
+                n_classes += 1
+                class_acc += class_pred
+        
+        return class_acc / n_classes
+
+    
+    def confusion_matrix_iemocap(self, utt_preds):
+        """Compute confusion matrix given the predictions.
+
+        Parameters
+        ----------
+        utt_preds : ndarray
+            Processed predictions.
+
+        """
+        conf = confusion_matrix(self.actual_target, utt_preds)
+        
+        # Make confusion matrix into data frame for readability
+        conf_fmt = pd.DataFrame({"ang": conf[:, 0], "sad": conf[:, 1],
+                             "hap": conf[:, 2], "neu": conf[:, 3]})
+        conf_fmt = conf_fmt.to_string(index=False)
+        print(conf_fmt)
+        return (conf, conf_fmt)
+
+
+class SERDataset:
+    """
+    包装 `TrainDataset` 和 `TestDataset`，加载和预处理语音频谱图到 `Dataset` 对象中。
+    
+    这还根据 IEMOCAP 交叉验证安排将数据集分配为训练、验证和测试数据集。总共有 10 个说话者（5 个会话 x 每个会话 2 个说话者），分配的 ID 是 1F, 1M, 2F, 2M, 3F, 3M, 4F, 4M, 5F, 5M。
+
+    参数
+    ----------
+    features_data
+        使用 `extract_features.py` 提取的频谱图，标签
+    num_classes
+        情感类别的数量
+    val_speaker_id
+        在 k 折交叉验证中用作验证的说话者 ID
+    test_speaker_id
+        在 k 折交叉验证中用作测试的说话者 ID 
+    oversample : bool
+        设置为 'True' 以应用随机数据集过采样以平衡类别
+    """
+    def __init__(self, features_data, num_classes = 7,
+                val_speaker_id='1M', test_speaker_id='1F', 
+                oversample=False):
+        
+        """
+        features_data 格式: 字典
+            {speaker_id: (data_tot, labels_tot, labels_segs_tot, segs)}
+
+            [0] data_tot: 所有频谱段，形状 =  (N_segment, Channels, Freq., Time)
+            [1] labels_tot: 每个话语的标签
+            [2] labels_seg_tot: 每个段的标签（每个话语可能会被分成多个段）
+            [3] segs: 每个话语的段数
+        """
+
+        #get training spectrograms
+        train_spec_data, train_mfcc_data, train_audio_data, train_seg_labels, train_labels = None, None, None, None, None
+        for speaker_id in features_data.keys():
+            if speaker_id in [val_speaker_id, test_speaker_id]:
+                continue
+            #Concatenate spectrograms from speakers in training set
+            if train_mfcc_data is None:
+                train_spec_data = features_data[speaker_id]['seg_spec'].astype(np.float32)
+                train_mfcc_data = features_data[speaker_id]['seg_mfcc'].astype(np.float32)
+                train_audio_data = features_data[speaker_id]['seg_audio'].astype(np.float32)
+            else:
+                train_spec_data = np.concatenate((train_spec_data, 
+                                            features_data[speaker_id]['seg_spec'].astype(np.float32) ),
+                                            axis=0)
+                train_mfcc_data = np.concatenate((train_mfcc_data, 
+                                            features_data[speaker_id]['seg_mfcc'].astype(np.float32) ),
+                                            axis=0)
+                train_audio_data = np.concatenate((train_audio_data, 
+                                            features_data[speaker_id]['seg_audio'].astype(np.float32) ),
+                                            axis=0)
+
+            #Concatenate the corresponding labels
+            if train_seg_labels is None:
+                train_seg_labels = features_data[speaker_id]['seg_label'].astype(np.long)
+                train_labels = features_data[speaker_id]['utter_label'].astype(np.long)
+            else:
+                train_seg_labels = np.concatenate((train_seg_labels,
+                                               features_data[speaker_id]['seg_label'].astype(np.long)),
+                                               axis=0)
+                train_labels = np.concatenate((train_labels,
+                                               features_data[speaker_id]['utter_label'].astype(np.long)),
+                                               axis=0)
+                                             
+        self.train_spec_data = train_spec_data
+        self.train_mfcc_data = train_mfcc_data
+        self.train_audio_data = train_audio_data
+        self.train_seg_labels = train_seg_labels
+        self.train_labels    = train_labels
+        self.num_classes     = num_classes
+        
+        #get validation spectrograms
+        self.val_spec_data  = features_data[val_speaker_id]['seg_spec'].astype(np.float32)
+        self.val_mfcc_data  = features_data[val_speaker_id]['seg_mfcc'].astype(np.float32)
+        self.val_audio_data  = features_data[val_speaker_id]['seg_audio'].astype(np.float32)
+        self.val_seg_labels = features_data[val_speaker_id]['seg_label'].astype(np.long)
+        self.val_labels     = features_data[val_speaker_id]['utter_label'].astype(np.long)
+        self.val_num_segs   = features_data[val_speaker_id]['seg_num']
+
+        #get test spectrograms
+        self.test_spec_data  = features_data[test_speaker_id]['seg_spec'].astype(np.float32)
+        self.test_mfcc_data  = features_data[test_speaker_id]['seg_mfcc'].astype(np.float32)
+        self.test_audio_data  = features_data[test_speaker_id]['seg_audio'].astype(np.float32)
+        self.test_seg_labels = features_data[test_speaker_id]['seg_label'].astype(np.long)
+        self.test_labels     = features_data[test_speaker_id]['utter_label'].astype(np.long)
+        self.test_num_segs   = features_data[test_speaker_id]['seg_num']
+        '''
+        # used when training with leave-one-session-out validation strategy
+        self.val_spec_data = np.concatenate((self.val_spec_data, self.test_spec_data), axis=0)
+        self.val_mfcc_data = np.concatenate((self.val_mfcc_data, self.test_mfcc_data), axis=0)
+        self.val_audio_data = np.concatenate((self.val_audio_data, self.test_audio_data), axis=0)
+        self.val_seg_labels = np.concatenate((self.val_seg_labels, self.test_seg_labels), axis=0)
+        self.val_labels = np.concatenate((self.val_labels, self.test_labels), axis=0)
+        self.val_num_segs = np.concatenate((self.val_num_segs, self.test_num_segs), axis=0)
+        
+        self.test_spec_data  = self.val_spec_data
+        self.test_mfcc_data  = self.val_mfcc_data
+        self.test_audio_data  = self.val_audio_data
+        self.test_seg_labels = self.val_seg_labels
+        self.test_labels     = self.val_labels
+        self.test_num_segs   = self.val_num_segs
+        '''
+
+        #Normalize dataset to the range of [0, 1] suitable as image pixel
+        self._normalize('minmax')
+
+        #Random oversampling on training dataset
+        if oversample == True:
+            print('\nPerform training dataset oversampling')
+            datar, labelr = random_oversample(self.train_spec_data, self.train_labels)
+            datar, labelr = random_oversample(datar,labelr)
+            self.train_spec_data = datar
+            self.train_labels = labelr
+
+        
+        train_spec_data_shape = self.train_spec_data.shape
+        val_spec_data_shape = self.val_spec_data.shape
+        test_spec_data_shape = self.test_spec_data.shape
+
+        #convert normalized spectrogram to 3 channel image, apply AlexNet image pre-processing
+        self.train_spec_data = self._spec_to_gray(self.train_spec_data)
+        self.val_spec_data = self._spec_to_gray(self.val_spec_data)
+        self.test_spec_data = self._spec_to_gray(self.test_spec_data)
+        self.num_in_ch = 1
+
+        #self.train_data = train_spec_data, train_mfcc_data
+        self.train_data = defaultdict()
+        self.train_data["seg_spec"] = self.train_spec_data
+        self.train_data["seg_mfcc"] = self.train_mfcc_data
+        self.train_data["seg_audio"] = self.train_audio_data
+        self.train_data["seg_label"] = self.train_seg_labels
+        # self.train_data["utter_label"] = self.train_labels
+
+        #self.val_data = self.val_spec_data, self.val_mfcc_data
+        self.val_data = defaultdict()
+        self.val_data["seg_spec"] = self.val_spec_data
+        self.val_data["seg_mfcc"] = self.val_mfcc_data       
+        self.val_data["seg_audio"] = self.val_audio_data  
+        self.val_data["seg_label"] = self.val_seg_labels
+        self.val_data["utter_label"] = self.val_labels
+        self.val_data["seg_num"] = self.val_num_segs
+                
+        #self.test_data = self.test_spec_data, self.test_mfcc_data
+        self.test_data = defaultdict()
+        self.test_data["seg_spec"] = self.test_spec_data
+        self.test_data["seg_mfcc"] = self.test_mfcc_data
+        self.test_data["seg_audio"] = self.test_audio_data
+        self.test_data["seg_label"] = self.test_seg_labels
+        self.test_data["utter_label"] = self.test_labels
+        self.test_data["seg_num"] = self.test_num_segs
+                             
+        assert len(self.train_spec_data) == train_spec_data_shape[0]
+        assert len(self.val_spec_data) == val_spec_data_shape[0]
+        assert len(self.test_spec_data) == test_spec_data_shape[0]
+
+        assert val_spec_data_shape[0] == self.val_seg_labels.shape[0] == sum(self.val_num_segs)
+        assert self.val_labels.shape[0] == self.val_num_segs.shape[0]
+        assert test_spec_data_shape[0] == self.test_seg_labels.shape[0] == sum(self.test_num_segs)
+        assert self.test_labels.shape[0] == self.test_num_segs.shape[0]
+        
+            
+        print('\n<<DATASET>>\n')
+        print(f'Val. speaker id : {val_speaker_id}')
+        print(f'Test speaker id : {test_speaker_id}')
+        print(f'Train data      : {train_spec_data_shape}')
+        print(f'Train labels    : {self.train_seg_labels.shape}')
+        print(f'Eval. data      : {val_spec_data_shape}')
+        print(f'Eval. label     : {self.val_labels.shape}')
+        print(f'Eval. seg labels: {self.val_seg_labels.shape}')
+        print(f'Eval. num seg   : {self.val_num_segs.shape}')
+        print(f'Test data       : {test_spec_data_shape}')
+        print(f'Test label      : {self.test_labels.shape}')
+        print(f'Test seg labels : {self.test_seg_labels.shape}')
+        print(f'Test num seg    : {self.test_num_segs.shape}')
+        print('\n')
+
+    
+    def _normalize(self, scaling):
+        
+        '''
+        calculate normalization factor from training dataset and apply to
+           the whole dataset
+        '''
+        
+        #get data range
+        input_range = self._get_data_range()
+
+        #re-arrange array from (N, C, F, T) to (C, -1, F)
+        nsegs = self.train_spec_data.shape[0]
+        nch   = self.train_spec_data.shape[1]
+        nfreq = self.train_spec_data.shape[2]
+        ntime = self.train_spec_data.shape[3]
+        rearrange = lambda x: x.transpose(1,0,3,2).reshape(nch,-1,nfreq)
+        self.train_spec_data = rearrange(self.train_spec_data)
+        self.val_spec_data   = rearrange(self.val_spec_data)
+        self.test_spec_data  = rearrange(self.test_spec_data)
+        
+        #scaler type
+        scaler = eval(SCALER_TYPE[scaling])
+
+        for ch in range(nch):
+            #get scaling values from training data
+            scale_values = scaler.fit(self.train_spec_data[ch])
+            
+            #apply to all
+            self.train_spec_data[ch] = scaler.transform(self.train_spec_data[ch])
+            self.val_spec_data[ch] = scaler.transform(self.val_spec_data[ch])
+            self.test_spec_data[ch] = scaler.transform(self.test_spec_data[ch])
+        
+        #Shape the data back to (N,C,F,T)
+        rearrange = lambda x: x.reshape(nch,-1,ntime,nfreq).transpose(1,0,3,2)
+        self.train_spec_data = rearrange(self.train_spec_data)
+        self.val_spec_data   = rearrange(self.val_spec_data)
+        self.test_spec_data  = rearrange(self.test_spec_data)
+
+        print(f'\nDataset normalized with {scaling} scaler')
+        print(f'\tRange before normalization: {input_range}')
+        print(f'\tRange after  normalization: {self._get_data_range()}')
+
+    def _get_data_range(self):
+        #get data range
+        trmin = np.min(self.train_spec_data)
+        evmin = np.min(self.val_spec_data)
+        tsmin = np.min(self.test_spec_data)
+        dmin = np.min(np.array([trmin, evmin, tsmin]))
+
+        trmax = np.max(self.train_spec_data)
+        evmax = np.max(self.val_spec_data)
+        tsmax = np.max(self.test_spec_data)
+        dmax = np.max(np.array([trmax, evmax, tsmax]))
+        
+        return [dmin, dmax]
+
+    def _spec_to_rgb(self,data):
+
+        """
+        将归一化的频谱图转换为基于pyplot颜色映射的伪RGB图像
+        并应用AlexNet图像预处理
+        
+        输入: data
+            - 形状 (N,C,H,W) = (num_spectrogram_segments, 1, Freq, Time)
+            - 数据范围 [0.0, 1.0]
+        """
+
+        # AlexNet 预处理
+        alexnet_preprocess = transforms.Compose([
+            transforms.Resize(224),
+            #transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            ]) 
+
+        # 获取颜色映射以将归一化的频谱图转换为 RGB
+        cm = plt.get_cmap('jet') #brg #gist_heat #brg #bwr
+
+        # 翻转频率轴以将图像向上定向，移除通道轴
+        data = np.flip(data,axis=2)
+        
+        data = np.squeeze(data, axis=1) 
+
+        data_tensor = list()
+
+        for i, seg in enumerate(data):
+            seg = np.clip(seg, 0.0, 1.0)
+            seg_rgb = (cm(seg)[:,:,:3]*255.0).astype(np.uint8)
+            
+            img = Image.fromarray(seg_rgb, mode='RGB')
+
+            data_tensor.append(alexnet_preprocess(img))
+        
+        return data_tensor
+
+
+    def _spec_to_gray(self,data):
+
+        """
+        Convert normalized spectrogram to 3-channel gray image (identical data on each channel)
+            and apply AlexNet image pre-processing
+        
+        Input: data
+                - shape (N,C,H,W) = (num_spectrogram_segments, 1, Freq, Time)
+                - data range [0.0, 1.0]
+        """
+
+        #AlexNet preprocessing
+        alexnet_preprocess = transforms.Compose([
+                transforms.Resize(256),
+                #transforms.CenterCrop(224),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+                ]) 
+
+        #Convert format to uint8, flip the frequency axis to orientate image upward, 
+        #   duplicate into 3 channels
+        data = np.clip(data,0.0, 1.0)
+        data = (data*255.0).astype(np.uint8)
+        data = np.flip(data,axis=2)
+        data = np.moveaxis(data,1,-1)
+        data = np.repeat(data,3,axis=-1)
+       
+        data_tensor = list()
+        for i, seg in enumerate(data):
+            img = Image.fromarray(seg, mode='RGB')
+            data_tensor.append(alexnet_preprocess(img))
+            
+        return data_tensor  
+    
+    def get_train_dataset(self):
+        #print(self.train_mfcc_data.shape)
+        #print(self.train_seg_labels.shape)
+        #print(self.train_labels.shape)
+        return TrainDataset(
+            self.train_data, num_classes=self.num_classes)
+    
+    def get_val_dataset(self):
+        return TestDataset(
+            self.val_data, num_classes=self.num_classes)
+    
+    def get_test_dataset(self):
+        return TestDataset(
+            self.test_data, num_classes=self.num_classes)
+    
+class SERInput:
+    """
+    适配单说话者实时数据版本的SER数据集类
+    - 处理无标签数据
+    - 禁用过采样
+    - 简化数据加载逻辑
+    """
+    def __init__(self, features_data):
+        # 直接从features_data['audio']获取数据
+        audio_features = features_data['audio']
+        
+        # 初始化训练数据 (全部数据视为训练数据)
+        self.spec_data = audio_features['seg_spec'].astype(np.float32)
+        self.mfcc_data = audio_features['seg_mfcc'].astype(np.float32)
+        self.audio_data = audio_features['seg_audio'].astype(np.float32)
+        self.seg_num = audio_features['seg_num']
+
+        # 禁用标签相关属性
+        self.train_seg_labels = None
+        self.train_labels = None
+        self.num_classes = 7  # 无类别
+
+        # 验证/测试数据置空
+        # self.val_spec_data = np.array([])
+        # self.val_mfcc_data = np.array([])
+        # self.val_audio_data = np.array([])
+        # self.test_spec_data = np.array([])
+        # self.test_mfcc_data = np.array([])
+        # self.test_audio_data = np.array([])
+
+        # 数据归一化
+        self._normalize('minmax')
+
+        # 转换为灰度图像格式
+        self.spec_data = self._spec_to_gray(self.spec_data)
+        self.num_in_ch = 1
+
+        # 构建数据字典
+        self.data = {
+            "seg_spec": self.spec_data,
+            "seg_mfcc": self.mfcc_data,
+            "seg_audio": self.audio_data,
+            "seg_num": self.seg_num
+        }
+
+        # 移除原代码中的断言和验证逻辑
+        # print('\n<< 实时数据处理配置 >>')
+        # print(f'有效数据段数: {self.spec_data.shape[0]}')
+        # print(f'频谱图维度: {self.spec_data.shape}')
+        # print(f'MFCC特征维度: {self.mfcc_data.shape}')
+        # print(f'音频波形维度: {self.audio_data.shape}\n')
+
+    def _normalize(self, scaling):
+        """归一化处理"""
+        # 计算原始数据范围
+        input_min = np.min(self.spec_data)
+        input_max = np.max(self.spec_data)
+        
+        # 执行最小-最大归一化
+        self.spec_data = (self.spec_data - input_min) / (input_max - input_min + 1e-8)
+        
+        # print(f'\n数据归一化完成')
+        # print(f'\t原始范围: [{input_min:.2f}, {input_max:.2f}]')
+        # print(f'\t归一化后范围: [{np.min(self.spec_data):.2f}, {np.max(self.spec_data):.2f}]')
+        # print(f"归一化后的shape：{self.spec_data.shape}")
+
+    def _spec_to_gray(self, data):
+        """适配实时数据的灰度转换"""
+        # 移除AlexNet预处理
+        # data = np.clip(data, 0.0, 1.0)
+        # data = (data * 255.0).astype(np.uint8)
+        # data = np.flip(data, axis=2)  # 频率轴翻转
+        # return data
+
+        alexnet_preprocess = transforms.Compose([
+                transforms.Resize(256),
+                #transforms.CenterCrop(224),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+                ]) 
+
+        #Convert format to uint8, flip the frequency axis to orientate image upward, 
+        #   duplicate into 3 channels
+        data = np.clip(data,0.0, 1.0)
+        data = (data*255.0).astype(np.uint8)
+        data = np.flip(data,axis=2)
+        data = np.moveaxis(data,1,-1)
+        data = np.repeat(data,3,axis=-1)
+       
+        data_tensor = list()
+        for i, seg in enumerate(data):
+            img = Image.fromarray(seg, mode='RGB')
+            data_tensor.append(alexnet_preprocess(img))
+
+        # print(f"gray后shape：{np.array(data_tensor).shape}")
+            
+        return np.array(data_tensor)
+
+    def get_data(self):
+        """返回统一数据接口"""
+        return self.data
+
+                       
+
+def random_oversample(data, labels):
+    print('\tOversampling method: Random Oversampling')
+    ros = RandomOverSampler(random_state=0,sampling_strategy='minority')
+
+    n_samples = data.shape[0]
+    fh = data.shape[2]
+    fw = data.shape[3]
+    n_features= fh*fw
+
+    data = np.squeeze(data,axis=1)
+    data = np.reshape(data,(n_samples, n_features))
+    data_resampled, label_resampled = ros.fit_resample(data, labels)
+    n_samples = data_resampled.shape[0]
+    data_resampled = np.reshape(data_resampled,(n_samples,fh,fw))
+    data_resampled = np.expand_dims(data_resampled, axis=1)
+
+    return data_resampled, label_resampled
+
+def targeted_oversample(data, labels, target_classes=[2, 6]):
+    """
+    仅对目标类别（fea 和 sur）进行随机过采样，以平衡数据集。
+
+    参数:
+        - data: 形状为 (N, C, H, W) 的 numpy 数组
+        - labels: 样本的标签数组
+        - target_classes: 需要进行过采样的类别列表，如 [2, 6] 对应 fea 和 sur
+
+    返回:
+        - 过采样后的数据和标签
+    """
+    print('\tThe specified category is being oversampled: ', target_classes)
+
+    # 统计数据集中每个类别的数量
+    label_counts = Counter(labels)
+
+    # 确定目标类别的采样策略，将 fea 和 sur 增加到最大类别数量
+    max_class_count = max(label_counts.values())  # 获取当前数据集中样本最多的类别数量
+    sampling_strategy = {cls: max_class_count for cls in target_classes if cls in label_counts}
+
+    # 如果 '`fea` 和 `sur` 原本就很接近最大类别数量，则不执行过采样
+    if not sampling_strategy:
+        print("\tNo oversampling is required, and the number of samples in the target category is close to the maximum category.")
+        return data, labels
+
+    # 重新调整数据形状以匹配 imbalanced-learn 需求
+    n_samples, _, fh, fw = data.shape  # 获取原始数据形状
+    n_features = fh * fw  # 计算每个样本的特征数量
+
+    data = np.squeeze(data, axis=1)  # 移除通道维度
+    data = np.reshape(data, (n_samples, n_features))  # 展平数据以适应 `RandomOverSampler`
+
+    # 进行随机过采样
+    ros = RandomOverSampler(sampling_strategy=sampling_strategy, random_state=0)
+    data_resampled, labels_resampled = ros.fit_resample(data, labels)
+
+    # 还原数据形状
+    n_samples_new = data_resampled.shape[0]
+    data_resampled = np.reshape(data_resampled, (n_samples_new, fh, fw))
+    data_resampled = np.expand_dims(data_resampled, axis=1)  # 恢复通道维度
+
+    return data_resampled, labels_resampled
+    
+def multimodal_oversample(data_list, labels):
+    """ 同步过采样多模态数据 """
+    unique, counts = np.unique(labels, return_counts=True)
+    max_count = counts.max()
+    
+    resampled_data = [[] for _ in range(len(data_list))]
+    resampled_labels = []
+    
+    for class_idx in unique:
+        indices = np.where(labels == class_idx)[0]
+        need = max_count - len(indices)
+        
+        if need > 0:
+            supplement = np.random.choice(indices, need)
+            for i in range(len(data_list)):
+                resampled_data[i].append(np.concatenate(
+                    [data_list[i][indices], data_list[i][supplement]]
+                ))
+            resampled_labels.append(np.concatenate(
+                [labels[indices], labels[supplement]]
+            ))
+        else:
+            for i in range(len(data_list)):
+                resampled_data[i].append(data_list[i][indices])
+            resampled_labels.append(labels[indices])
+    
+    augmented_data = [np.concatenate(d) for d in resampled_data]
+    augmented_labels = np.concatenate(resampled_labels)
+    return augmented_data, augmented_labels
+    
+def targeted_multimodal_oversample(data_modalities, labels, target_classes, random_seed=42):
+    assert len(data_modalities) > 0, "必须提供至少一个模态的数据"
+    n_samples = len(labels)
+    for data in data_modalities:
+        assert len(data) == n_samples, "模态数据与标签数量不匹配"
+
+    resampled_data = [[] for _ in range(len(data_modalities))]
+    resampled_labels = []
+
+    # 遍历所有类别
+    unique_classes = np.unique(labels)
+    for class_idx in unique_classes:
+        class_indices = np.where(labels == class_idx)[0]
+
+        if class_idx in target_classes:
+            majority_size = max([np.sum(labels == c) for c in unique_classes])
+            target_size = int(majority_size * 1.2)
+        else:
+            target_size = len(class_indices)
+
+        resampled_indices = resample(
+            class_indices,
+            replace=True if target_size > len(class_indices) else False,
+            n_samples=target_size,
+            random_state=random_seed
+        )
+
+        for mod_idx in range(len(data_modalities)):
+            resampled_data[mod_idx].append(data_modalities[mod_idx][resampled_indices])
+        resampled_labels.append(labels[resampled_indices])
+
+    final_data = [np.concatenate(mod_data, axis=0) for mod_data in resampled_data]
+    final_labels = np.concatenate(resampled_labels, axis=0)
+
+    shuffle_indices = np.random.permutation(len(final_labels))
+    return [data[shuffle_indices] for data in final_data], final_labels[shuffle_indices]
+
+
+
+

@@ -7,19 +7,7 @@ from ui_emotiondetect3 import Ui_FACELOOK
 # import bg_rc
 import cv2
 from PIL import Image
-# from skimage import io
-# from skimage.transform import resize
-# import os
-# import torch
-# import pickle
-# from torchvision import transforms
-# from model import FaceClassifierResNet18
-# from model import FaceDetectorResNet34
-# from model import EmojiResNet18
-# import numpy as np
-# from torch.autograd import Variable
-# import argparse
-# import sys
+from audio import AudioProcessor
 
 from explainPart import save_grad_cam_result
 
@@ -30,6 +18,8 @@ class CameraPageWindow(QWidget, Ui_FACELOOK):
         super(CameraPageWindow, self).__init__(parent)
         self.timer_camera = QTimer()  # 初始化定时器
         self.cap = cv2.VideoCapture(0)  # 初始化摄像头
+        self.audio = AudioProcessor()
+        self.audio.pause()
         self.CAM_NUM = 0
         self.setupUi(self)
         self.initUI()
@@ -91,19 +81,23 @@ class CameraPageWindow(QWidget, Ui_FACELOOK):
     # 打开摄像头
     def openCamera(self):
         self.timer_camera.start(30)
+        self.audio.resume()
         self.cameraLabel.clear()
-        self.cameraButton.setText('关闭摄像头')
+        self.cameraButton.setText('停止识别')
 
     # 关闭摄像头
     def closeCamera(self):
         self.timer_camera.stop()
+        self.audio.pause()
         self.cameraLabel.clear()
-        self.cameraButton.setText('打开摄像头')
+        self.cameraButton.setText('开始识别')
 
     def exitApp(self):
         # 关闭摄像头资源
         if self.timer_camera.isActive():
             self.timer_camera.stop()
+                    
+        self.audio.stop()
         self.cap.release()
         cv2.destroyAllWindows()
         # 发射退出信号

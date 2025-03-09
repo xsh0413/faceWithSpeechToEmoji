@@ -19,6 +19,8 @@ from PyQt5.QtWidgets import *
 from PyQt5.QtCore import *
 from call_camerapage import CameraPageWindow
 from explainPart import *
+from audio import AudioProcessor
+import time
 # import time
 
 
@@ -83,7 +85,7 @@ emojis = [0] * 10
 #     emojis_img = io.imread('images/emojis/%s.png' % str(class_names[new_idx]))
 #     emojis_img = cv2.cvtColor(emojis_img, cv2.COLOR_RGB2BGR)
 #     return emojis_img
-def get_emoji(face):  # should be BGR image
+def get_emoji(face,audio_result):  # should be BGR image
     # 将 BGR 图像转换为 RGB 格式
     raw_img = cv2.cvtColor(face, cv2.COLOR_BGR2RGB)
 
@@ -103,9 +105,13 @@ def get_emoji(face):  # should be BGR image
         outputs = emoji_net(inputs)
 
     outputs_avg = outputs.view(ncrops, -1).mean(0)  # avg over crops
-    _, predicted = torch.max(outputs_avg.data, 0)
+    # _, predicted = torch.max(outputs_avg.data, 0)
+    outputs_avg = np.array(outputs_avg.cpu().numpy())
+    # print(f"output：{outputs_avg}")
+    # print(f"audio：{audio_result}")
+    predicted = np.argmax(outputs_avg+audio_result)
 
-    idx = int(predicted.cpu().numpy())
+    idx = int(predicted)
     emojis.append(idx)
     emojis.pop(0)
 
@@ -247,10 +253,16 @@ def init(model_type):
 def run():
     app = QApplication(sys.argv)
     myWin = CameraPageWindow()
+    # audioProcessor = AudioProcessor()
+    # audioProcessor.pause()
     myWin.show()
 
     while myWin.isVisible():
         if myWin.flag_:
+            # if myWin.audio.is_paused == True:
+            #     start_time = time.time()
+            #     audioProcessor.resume()
+
             ret, frame = myWin.cap.read()
             if not ret:
                 print("No camera found")
@@ -272,8 +284,22 @@ def run():
             face = get_face(frame, faces)
             draw_faces_rectangles(frame, faces)
 
+            # if time.time()-start_time > 3:
+            # if myWin.audio.no_result() == False:
+            #     audio_result = myWin.audio.get_result()
+            #     print(audio_result)
+            #     # 训练的时候ner在-3，而原项目中ner在最后
+            #     audio_result[-3:] = audio_result[[-2,-1,-3]]
+
+            # else:
+            #     audio_result = np.array([0]*7)
+
+            audio_result = myWin.audio.get_result()
+            # if audio_result.any()  == None:
+            #     audio_result = np.array([0]*7)
+
             if face is not None:
-                emoji = get_emoji(face)
+                emoji = get_emoji(face,audio_result)
                 face_emoji = concatenate_images(frame, face, emoji, 10)
                 myWin.getFaceemoji(face_emoji, face)
             else:
